@@ -1,0 +1,314 @@
+/******************************************************************************
+   4x M5 Mini Scale (SKU:U177) + OOCSI
+   - Scale data sent every 5 minutes
+   - Button presses sent immediately + weight snapshot at press moment
+   - Weight from 5 seconds before and after button press also sent
+   - Tare button on pin 4
+   - LED on pin 16 blinks on button press
+ ******************************************************************************/
+
+#include "OOCSI.h"
+#include <Wire.h>
+
+// ---- WiFi & OOCSI ----
+const char* ssid       = "BudgetThuis-734580";
+const char* password   = "9AA8U5H4V3A7K";
+const char* OOCSIName  = "DeD_Data_Handler_Trash_Bin_##";
+const char* hostserver = "oocsi.id.tue.nl";
+
+OOCSI oocsi = OOCSI();
+
+// ---- Registers ----
+#define WEIGHT_REG      0x10
+#define OFFSET_REG      0x50
+#define FILTER_LP_REG   0x80
+#define FILTER_AVG_REG  0x81
+#define FILTER_EMA_REG  0x82
+
+// ---- Scales ----
+const uint8_t SCALE_ADDRS[4] = {0x26, 0x27, 0x28, 0x29};
+
+// ---- Buttons ----
+const int BUTTON_PINS[]  = {17, 19, 18, 5};
+const int BUTTON_COUNT   = 4;
+bool      buttonLastState[BUTTON_COUNT];
+int       buttonEvent[BUTTON_COUNT];
+
+// ---- Tare button ----
+const int TARE_BUTTON_PIN  = 4;
+bool      tareLastState    = HIGH;
+
+// ---- LED ----
+const int LED_PIN          = 16;
+
+// ---- Timing ----
+const uint32_t SEND_INTERVAL_MS = 1UL * 60UL * 1000UL;  // 5 minutes
+uint32_t       lastSendTime     = 0;
+
+// ---- Weight history for "before" snapshot (~5 seconds) ----
+const int HISTORY_SIZE           = 10;
+float     weightHistory[HISTORY_SIZE];
+int       historyIndex           = 0;
+bool      historyFull            = false;
+
+// ---- "After" snapshot state ----
+const uint32_t AFTER_DELAY_MS    = 5000;
+bool           afterPending      = false;
+uint32_t       afterTriggerTime  = 0;
+
+// ---- Functions ----
+
+float readWeight(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  Wire.write(WEIGHT_REG);
+  Wire.endTransmission();
+
+  Wire.requestFrom(addr, (uint8_t)4);
+
+  if (Wire.available() == 4) {
+    uint8_t bytes[4];
+    for (int i = 0; i < 4; i++) bytes[i] = Wire.read();
+    float weight;
+    memcpy(&weight, bytes, 4);
+    return weight;
+  }
+  return -1;
+}
+
+void blinkLED() {
+  digitalWrite(LED_PIN, HIGH);
+  delay(200);
+  digitalWrite(LED_PIN, LOW);
+}
+
+void tareAllScales() {
+  Serial.println("Taring all scales...");
+  for (int i = 0; i < 4; i++) {
+    Wire.beginTransmission(SCALE_ADDRS[i]);
+    Wire.write(OFFSET_REG);
+    Wire.write(0x01);
+    Wire.endTransmission();
+    Serial.print("  Scale ");
+    Serial.print(i + 1);
+    Serial.println(" tared.");
+  }
+  delay(500);
+
+  // Clear history buffer after tare so old readings don't pollute new data
+  historyFull  = false;
+  historyIndex = 0;
+
+  Serial.println("All scales tared!");
+  Serial.println("-------------------");
+}
+
+void setupFilters() {
+  for (int i = 0; i < 4; i++) {
+    Wire.beginTransmission(SCALE_ADDRS[i]);
+    Wire.write(FILTER_LP_REG);
+    Wire.write(0x00);
+    Wire.endTransmission();
+
+    Wire.beginTransmission(SCALE_ADDRS[i]);
+    Wire.write(FILTER_AVG_REG);
+    Wire.write(10);
+    Wire.endTransmission();
+
+    Wire.beginTransmission(SCALE_ADDRS[i]);
+    Wire.write(FILTER_EMA_REG);
+    Wire.write(0x00);
+    Wire.endTransmission();
+  }
+  Serial.println("Averaging filter set to 10 readings.");
+}
+
+// =====================================================================
+// OOCSI SEND #1 — Weight data, sent every 5 minutes + on button press
+// Fields: scale1, scale2, scale3, scale4, scaleTotal (floats, grams)
+// =====================================================================
+void sendWeightData(float weight[], float weightSum) {
+  oocsi.newMessage("DeD_Trash_Bin_2");
+  oocsi.addFloat("scale1",     weight[0]);
+  oocsi.addFloat("scale2",     weight[1]);
+  oocsi.addFloat("scale3",     weight[2]);
+  oocsi.addFloat("scale4",     weight[3]);
+  oocsi.addFloat("scaleTotal", weightSum);
+  oocsi.sendMessage();
+  Serial.println("[OOCSI] Weight data sent.");
+}
+
+// =====================================================================
+// OOCSI SEND #2 — Button press, sent immediately on any button press
+// Fields: button1, button2, button3, button4 (int, 0=idle, 1=pressed)
+// =====================================================================
+void sendButtonData() {
+  oocsi.newMessage("DeD_Trash_Bin_2");
+  oocsi.addInt("button4", buttonEvent[0]);
+  oocsi.addInt("button3", buttonEvent[1]);
+  oocsi.addInt("button2", buttonEvent[2]);
+  oocsi.addInt("button1", buttonEvent[3]);
+  oocsi.sendMessage();
+  Serial.println("[OOCSI] Button data sent.");
+}
+
+// =====================================================================
+// OOCSI SEND #3 — Trash removed event, sent when tare button pressed
+// Fields: trashRemoved (int, always 1 when sent)
+// =====================================================================
+void sendTrashRemovedEvent() {
+  oocsi.newMessage("DeD_Trash_Bin_2");
+  oocsi.addInt("trashRemoved", 1);
+  oocsi.sendMessage();
+  Serial.println("[OOCSI] Trash removed event sent.");
+}
+
+// =====================================================================
+// OOCSI SEND #4 — Weight ~5 seconds BEFORE button press
+// Fields: weightBefore (float, grams)
+// =====================================================================
+void sendWeightBefore() {
+  float beforeWeight = weightHistory[historyIndex];
+  oocsi.newMessage("DeD_Trash_Bin_2");
+  oocsi.addFloat("weightBefore", beforeWeight);
+  oocsi.sendMessage();
+  Serial.println("[OOCSI] Weight before button press sent.");
+}
+
+// =====================================================================
+// OOCSI SEND #5 — Weight ~5 seconds AFTER button press
+// Fields: weightAfter (float, grams)
+// =====================================================================
+void sendWeightAfter(float weightSum) {
+  oocsi.newMessage("DeD_Trash_Bin_2");
+  oocsi.addFloat("weightAfter", weightSum);
+  oocsi.sendMessage();
+  Serial.println("[OOCSI] Weight after button press sent.");
+}
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+
+  pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(TARE_BUTTON_PIN, INPUT_PULLUP);
+  oocsi.setActivityLEDPin(LED_BUILTIN);
+
+  for (int i = 0; i < BUTTON_COUNT; i++) {
+    pinMode(BUTTON_PINS[i], INPUT_PULLUP);
+    buttonLastState[i] = HIGH;
+    buttonEvent[i]     = 0;
+  }
+
+  // ---- Connect to WiFi & OOCSI first ----
+  oocsi.connect(OOCSIName, hostserver, ssid, password);
+  Serial.println("Subscribing to DeD_Trash_Bin_2");
+  oocsi.subscribe("DeD_Trash_Bin_2");
+
+  // ---- Then initialize scales ----
+  Serial.println("4x Mini Scale + OOCSI");
+  Serial.println("-------------------");
+
+  for (int i = 0; i < 4; i++) {
+    Wire.beginTransmission(SCALE_ADDRS[i]);
+    byte error = Wire.endTransmission();
+    if (error == 0) {
+      Serial.print("Scale ");
+      Serial.print(i + 1);
+      Serial.print(" found at 0x");
+      Serial.println(SCALE_ADDRS[i], HEX);
+    } else {
+      Serial.print("Scale ");
+      Serial.print(i + 1);
+      Serial.print(" NOT found at 0x");
+      Serial.println(SCALE_ADDRS[i], HEX);
+    }
+  }
+
+  Serial.println("-------------------");
+  delay(1000);
+
+  setupFilters();
+  tareAllScales();
+
+  lastSendTime = millis();
+}
+
+void loop() {
+  // ---- Tare button ----
+  bool tareState = digitalRead(TARE_BUTTON_PIN);
+  if (tareLastState == HIGH && tareState == LOW) {
+    Serial.println("Tare button pressed!");
+    blinkLED();
+    sendTrashRemovedEvent();                    // <-- OOCSI SEND #3
+    tareAllScales();
+  }
+  tareLastState = tareState;
+
+  // ---- Read all scales ----
+  float weight[4];
+  float weightSum = 0;
+
+  for (int i = 0; i < 4; i++) {
+    weight[i]  = readWeight(SCALE_ADDRS[i]);
+    weightSum += weight[i];
+  }
+
+  // ---- Update weight history buffer ----
+  weightHistory[historyIndex] = weightSum;
+  historyIndex = (historyIndex + 1) % HISTORY_SIZE;
+  if (historyIndex == 0) historyFull = true;
+
+  // ---- Regular buttons — send immediately on press ----
+  bool anyButtonPressed = false;
+  for (int i = 0; i < BUTTON_COUNT; i++) {
+    bool currentState = digitalRead(BUTTON_PINS[i]);
+    if (buttonLastState[i] == HIGH && currentState == LOW) {
+      buttonEvent[i]   = 1;
+      anyButtonPressed = true;
+      Serial.print("Button ");
+      Serial.print(i + 1);
+      Serial.println(" pressed!");
+    } else {
+      buttonEvent[i] = 0;
+    }
+    buttonLastState[i] = currentState;
+  }
+
+  if (anyButtonPressed) {
+    blinkLED();
+    sendButtonData();                           // <-- OOCSI SEND #2
+    sendWeightData(weight, weightSum);          // <-- OOCSI SEND #1 (on button press)
+
+    if (historyFull) {
+      sendWeightBefore();                       // <-- OOCSI SEND #4
+    } else {
+      Serial.println("History not full yet, skipping weightBefore.");
+    }
+
+    afterPending     = true;
+    afterTriggerTime = millis();
+  }
+
+  // ---- Send weight 5 seconds after button press ----
+  if (afterPending && millis() - afterTriggerTime >= AFTER_DELAY_MS) {
+    sendWeightAfter(weightSum);                 // <-- OOCSI SEND #5
+    afterPending = false;
+  }
+
+  // ---- Send weight data every 5 minutes ----
+  if (millis() - lastSendTime >= SEND_INTERVAL_MS) {
+    sendWeightData(weight, weightSum);          // <-- OOCSI SEND #1
+    lastSendTime = millis();
+  }
+
+  // ---- Print readings to Serial ----
+  Serial.print("Scale 1: "); Serial.print(weight[0]); Serial.print("g  |  ");
+  Serial.print("Scale 2: "); Serial.print(weight[1]); Serial.print("g  |  ");
+  Serial.print("Scale 3: "); Serial.print(weight[2]); Serial.print("g  |  ");
+  Serial.print("Scale 4: "); Serial.print(weight[3]); Serial.print("g  |  ");
+  Serial.print("Total: ");   Serial.print(weightSum); Serial.println("g");
+
+  oocsi.keepAlive();
+  delay(500);
+}
